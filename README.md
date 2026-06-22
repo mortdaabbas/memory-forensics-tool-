@@ -1,4 +1,4 @@
-Set-Content -Path README.md -Value @'
+
 # FMEM - Windows 11 Physical Memory Carver
 
 FMEM is a specialized Python-based memory forensics framework designed to parse and carve active processes, metadata, and kernel structures directly from raw physical memory dumps. Built to support deep forensic incident response workflows, it handles modern system behaviors like Kernel Address Space Layout Randomization (KASLR) and page table faults.
