@@ -1,4 +1,5 @@
 import contextlib
+import hashlib
 import io
 import logging
 import queue
@@ -18,6 +19,9 @@ log = logging.getLogger(__name__)
 
 DEFAULT_CR3 = 0x1AE000
 DEFAULT_KERNEL_BASE = 0xF805C7400000
+DEFAULT_DUMP_SIZE = 64 * 1024 * 1024
+HASH_ALGORITHMS = ("md5", "sha1", "sha256")
+KERNEL_POINTER_THRESHOLD = 0xFFFF800000000000
 
 
 class FmemGui(tk.Tk):
@@ -37,6 +41,7 @@ class FmemGui(tk.Tk):
         self.cr3_var = tk.StringVar(value=hex(DEFAULT_CR3))
         self.start_eprocess_var = tk.StringVar(value="0x1000")
         self.pid_var = tk.StringVar()
+        self.hash_algorithm_var = tk.StringVar(value="sha256")
         self.status_var = tk.StringVar(value="Select a memory image and run a plugin.")
 
         self._build_ui()
@@ -56,9 +61,9 @@ class FmemGui(tk.Tk):
 
         options_frame = ttk.Frame(self, padding=(12, 0, 12, 8))
         options_frame.grid(row=1, column=0, sticky="ew")
-        for column in range(8):
+        for column in range(10):
             options_frame.columnconfigure(column, weight=0)
-        options_frame.columnconfigure(7, weight=1)
+        options_frame.columnconfigure(9, weight=1)
 
         ttk.Label(options_frame, text="Profile").grid(row=0, column=0, sticky="w")
         ttk.Combobox(
@@ -80,8 +85,17 @@ class FmemGui(tk.Tk):
             padx=(6, 16),
         )
 
-        ttk.Label(options_frame, text="DLL PID").grid(row=0, column=6, sticky="w")
-        ttk.Entry(options_frame, textvariable=self.pid_var, width=12).grid(row=0, column=7, sticky="w", padx=(6, 0))
+        ttk.Label(options_frame, text="Target PID").grid(row=0, column=6, sticky="w")
+        ttk.Entry(options_frame, textvariable=self.pid_var, width=12).grid(row=0, column=7, sticky="w", padx=(6, 16))
+
+        ttk.Label(options_frame, text="Hash").grid(row=0, column=8, sticky="w")
+        ttk.Combobox(
+            options_frame,
+            textvariable=self.hash_algorithm_var,
+            values=HASH_ALGORITHMS,
+            width=9,
+            state="readonly",
+        ).grid(row=0, column=9, sticky="w", padx=(6, 0))
 
         body = ttk.PanedWindow(self, orient=tk.HORIZONTAL)
         body.grid(row=2, column=0, sticky="nsew", padx=12, pady=(0, 8))
@@ -113,7 +127,19 @@ class FmemGui(tk.Tk):
             sticky="ew",
             pady=3,
         )
-        ttk.Button(action_frame, text="Clear", command=self._clear_table).grid(row=4, column=0, sticky="ew", pady=(18, 3))
+        ttk.Button(action_frame, text="Dump PID", command=lambda: self._start_plugin("windows.procdump")).grid(
+            row=4,
+            column=0,
+            sticky="ew",
+            pady=(18, 3),
+        )
+        ttk.Button(action_frame, text="Hash Image", command=lambda: self._start_plugin("hash.image")).grid(
+            row=5,
+            column=0,
+            sticky="ew",
+            pady=3,
+        )
+        ttk.Button(action_frame, text="Clear", command=self._clear_table).grid(row=6, column=0, sticky="ew", pady=(18, 3))
 
         table_frame = ttk.Frame(body)
         body.add(table_frame, weight=1)
@@ -154,6 +180,10 @@ class FmemGui(tk.Tk):
             messagebox.showerror("fmem", f"Invalid numeric value: {exc}")
             return
 
+        if plugin_name == "windows.procdump" and target_pid is None:
+            messagebox.showwarning("fmem", "Enter a target PID before dumping process memory.")
+            return
+
         self.status_var.set(f"Running {plugin_name}...")
         self._clear_table()
 
@@ -164,6 +194,7 @@ class FmemGui(tk.Tk):
             "start_eprocess": start_eprocess,
             "target_pid": target_pid,
             "plugin_name": plugin_name,
+            "hash_algorithm": self.hash_algorithm_var.get(),
         }
         self.worker = threading.Thread(target=self._run_worker, kwargs=args, daemon=True)
         self.worker.start()
@@ -176,6 +207,7 @@ class FmemGui(tk.Tk):
         start_eprocess: int,
         target_pid: Optional[int],
         plugin_name: str,
+        hash_algorithm: str,
     ) -> None:
         try:
             title, headers, rows = run_plugin_for_gui(
@@ -185,6 +217,7 @@ class FmemGui(tk.Tk):
                 start_eprocess=start_eprocess,
                 target_pid=target_pid,
                 plugin_name=plugin_name,
+                hash_algorithm=hash_algorithm,
             )
             self.result_queue.put(("result", (title, headers, rows)))
         except Exception as exc:
@@ -252,9 +285,15 @@ def run_plugin_for_gui(
     start_eprocess: int,
     target_pid: Optional[int],
     plugin_name: str,
+    hash_algorithm: str = "sha256",
 ) -> Tuple[str, List[str], List[Dict[str, Any]]]:
     physical_layer, context, eprocess_layout = build_context(image_path, profile, cr3)
     try:
+        if plugin_name == "hash.image":
+            digest = hash_file(image_path, hash_algorithm)
+            rows = [{"File": str(image_path), "Algorithm": hash_algorithm.upper(), "Hash": digest}]
+            return "Image Hash", ["File", "Algorithm", "Hash"], rows
+
         if plugin_name == "windows.pslist":
             with contextlib.redirect_stdout(io.StringIO()):
                 entries = physical_process_carver(physical_layer)
@@ -321,9 +360,82 @@ def run_plugin_for_gui(
             ]
             return "NetScan", ["Protocol", "Local", "Remote", "Status", "PID"], rows
 
+        if plugin_name == "windows.procdump":
+            if target_pid is None:
+                raise ValueError("Target PID is required for process memory dump")
+            dump_info = dump_process_memory_by_pid(
+                context=context,
+                start_eprocess=start_eprocess,
+                target_pid=target_pid,
+                eprocess_layout=eprocess_layout,
+                output_dir=image_path.parent,
+                hash_algorithm=hash_algorithm,
+            )
+            return "Process Dump", ["PID", "Process", "Dump File", "Offset", "Size", "Algorithm", "Hash"], [dump_info]
+
         raise ValueError(f"Unsupported plugin: {plugin_name}")
     finally:
         physical_layer.close()
+
+
+def hash_file(path: Path, algorithm: str) -> str:
+    normalized = algorithm.lower()
+    if normalized not in HASH_ALGORITHMS:
+        raise ValueError(f"Unsupported hash algorithm: {algorithm}")
+
+    digest = hashlib.new(normalized)
+    with path.open("rb") as file_obj:
+        for chunk in iter(lambda: file_obj.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def dump_process_memory_by_pid(
+    context: MemoryContext,
+    start_eprocess: int,
+    target_pid: int,
+    eprocess_layout: Optional[Dict[str, Any]],
+    output_dir: Path,
+    hash_algorithm: str,
+    dump_size: int = DEFAULT_DUMP_SIZE,
+) -> Dict[str, Any]:
+    with contextlib.redirect_stdout(io.StringIO()):
+        process_entries = PsList(
+            start_eprocess=start_eprocess,
+            start_eprocess_phys=None,
+            layout=eprocess_layout,
+        ).run(context)
+
+    process = next((entry for entry in process_entries if entry.pid == target_pid), None)
+    if process is None:
+        raise ValueError(f"Process PID={target_pid} was not found")
+
+    physical_offset = _process_dump_offset(context, int(process.eprocess))
+    if physical_offset >= context.physical_layer.size:
+        raise ValueError(f"Process PID={target_pid} resolved outside the memory image")
+
+    readable_size = min(dump_size, context.physical_layer.size - physical_offset)
+    data = context.physical_layer.read_physical(physical_offset, readable_size)
+
+    safe_name = "".join(char if char.isalnum() or char in ("-", "_", ".") else "_" for char in process.name)
+    dump_path = output_dir / f"pid_{target_pid}_{safe_name}_0x{physical_offset:X}.dmp"
+    dump_path.write_bytes(data)
+
+    return {
+        "PID": target_pid,
+        "Process": process.name,
+        "Dump File": str(dump_path),
+        "Offset": hex(physical_offset),
+        "Size": readable_size,
+        "Algorithm": hash_algorithm.upper(),
+        "Hash": hash_file(dump_path, hash_algorithm),
+    }
+
+
+def _process_dump_offset(context: MemoryContext, eprocess_address: int) -> int:
+    if eprocess_address < KERNEL_POINTER_THRESHOLD:
+        return eprocess_address
+    return context.translation_layer.translate_address(eprocess_address)
 
 
 def _dll_target_pids(process_entries: List[Any], target_pid: Optional[int]) -> List[int]:
