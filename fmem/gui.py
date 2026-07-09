@@ -11,7 +11,16 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from .context import MemoryContext
 from .layers import PhysicalLayer, Windowsx64TranslationLayer
-from .plugins import DllList, NetScan, PsList, PsScan, create_demo_memory_file, physical_process_carver
+from .plugins import (
+    DllList,
+    NetScan,
+    PsList,
+    PsScan,
+    create_demo_memory_file,
+    hash_process_by_pid,
+    dump_process_memory_by_pid,
+    physical_process_carver,
+)
 from .structures import CR3Detector, REAL_EPROCESS_LAYOUT
 
 log = logging.getLogger(__name__)
@@ -69,7 +78,7 @@ class FmemGui(tk.Tk):
         ttk.Combobox(
             options_frame,
             textvariable=self.profile_var,
-            values=("auto", "mock", "win10"),
+            values=("auto", "win10"),
             width=10,
             state="readonly",
         ).grid(row=0, column=1, sticky="w", padx=(6, 16))
@@ -133,13 +142,7 @@ class FmemGui(tk.Tk):
             sticky="ew",
             pady=(18, 3),
         )
-        ttk.Button(action_frame, text="Hash Image", command=lambda: self._start_plugin("hash.image")).grid(
-            row=5,
-            column=0,
-            sticky="ew",
-            pady=3,
-        )
-        ttk.Button(action_frame, text="Clear", command=self._clear_table).grid(row=6, column=0, sticky="ew", pady=(18, 3))
+        ttk.Button(action_frame, text="Clear", command=self._clear_table).grid(row=5, column=0, sticky="ew", pady=(18, 3))
 
         table_frame = ttk.Frame(body)
         body.add(table_frame, weight=1)
@@ -153,6 +156,10 @@ class FmemGui(tk.Tk):
         x_scroll = ttk.Scrollbar(table_frame, orient=tk.HORIZONTAL, command=self.table.xview)
         x_scroll.grid(row=1, column=0, sticky="ew")
         self.table.configure(yscrollcommand=y_scroll.set, xscrollcommand=x_scroll.set)
+        self.table.bind("<Button-3>", self._on_table_right_click)
+
+        self.context_menu = tk.Menu(self, tearoff=0)
+        self.context_menu.add_command(label="Copy cell", command=self._copy_selected_cell)
 
         status = ttk.Label(self, textvariable=self.status_var, anchor="w", padding=(12, 0, 12, 10))
         status.grid(row=3, column=0, sticky="ew")
@@ -180,8 +187,8 @@ class FmemGui(tk.Tk):
             messagebox.showerror("fmem", f"Invalid numeric value: {exc}")
             return
 
-        if plugin_name == "windows.procdump" and target_pid is None:
-            messagebox.showwarning("fmem", "Enter a target PID before dumping process memory.")
+        if plugin_name in ("windows.procdump", "hash.process") and target_pid is None:
+            messagebox.showwarning("fmem", "Enter a target PID before dumping process memory or hashing a process.")
             return
 
         self.status_var.set(f"Running {plugin_name}...")
@@ -242,6 +249,28 @@ class FmemGui(tk.Tk):
     def _clear_table(self) -> None:
         self.table.delete(*self.table.get_children())
 
+    def _on_table_right_click(self, event: tk.Event) -> None:
+        item = self.table.identify_row(event.y)
+        column = self.table.identify_column(event.x)
+        if item and column:
+            self.table.selection_set(item)
+            self._right_click_item = (item, column)
+            self.context_menu.tk_popup(event.x_root, event.y_root)
+
+    def _copy_selected_cell(self) -> None:
+        if getattr(self, "_right_click_item", None) is None:
+            return
+        item, column = self._right_click_item
+        values = self.table.item(item, "values")
+        try:
+            column_index = int(column.replace("#", "")) - 1
+            text = str(values[column_index])
+        except (ValueError, IndexError):
+            return
+        self.clipboard_clear()
+        self.clipboard_append(text)
+        self.update()  # ensure clipboard is set on some platforms
+
     def _set_rows(self, headers: Iterable[str], rows: List[Dict[str, Any]]) -> None:
         headers = list(headers)
         self.table.configure(columns=headers)
@@ -258,8 +287,7 @@ def build_context(image_path: Path, profile: str, cr3: int) -> Tuple[PhysicalLay
         create_demo_memory_file(image_path)
 
     physical_layer = PhysicalLayer(image_path)
-    force_win_profile = image_path.name != "mock_memory.bin"
-    selected_profile = "win10" if force_win_profile else profile
+    selected_profile = profile
 
     if selected_profile == "auto":
         detector = CR3Detector(
@@ -289,10 +317,19 @@ def run_plugin_for_gui(
 ) -> Tuple[str, List[str], List[Dict[str, Any]]]:
     physical_layer, context, eprocess_layout = build_context(image_path, profile, cr3)
     try:
-        if plugin_name == "hash.image":
-            digest = hash_file(image_path, hash_algorithm)
-            rows = [{"File": str(image_path), "Algorithm": hash_algorithm.upper(), "Hash": digest}]
-            return "Image Hash", ["File", "Algorithm", "Hash"], rows
+        if plugin_name == "hash.process":
+            result = hash_process_by_pid(
+                context=context,
+                target_pid=target_pid,
+                start_eprocess=start_eprocess,
+                eprocess_layout=eprocess_layout,
+                hash_algorithm=hash_algorithm,
+            )
+            return (
+                f"Process Hash PID {target_pid}",
+                ["PID", "Process", "Algorithm", "Hash", "ModuleCount", "BytesHashed"],
+                [result],
+            )
 
         if plugin_name == "windows.pslist":
             with contextlib.redirect_stdout(io.StringIO()):
@@ -365,13 +402,13 @@ def run_plugin_for_gui(
                 raise ValueError("Target PID is required for process memory dump")
             dump_info = dump_process_memory_by_pid(
                 context=context,
-                start_eprocess=start_eprocess,
                 target_pid=target_pid,
+                start_eprocess=start_eprocess,
                 eprocess_layout=eprocess_layout,
                 output_dir=image_path.parent,
                 hash_algorithm=hash_algorithm,
             )
-            return "Process Dump", ["PID", "Process", "Dump File", "Offset", "Size", "Algorithm", "Hash"], [dump_info]
+            return "Process Dump", ["PID", "Process", "Dump File", "Bytes", "Algorithm", "Hash"], [dump_info]
 
         raise ValueError(f"Unsupported plugin: {plugin_name}")
     finally:

@@ -1,3 +1,5 @@
+import hashlib
+import hashlib
 import logging
 import os
 import socket
@@ -117,6 +119,173 @@ def _format_table(rows: List[Dict[str, Any]], headers: List[str]) -> None:
     for row in rows:
         print("| " + " | ".join(str(row.get(header, "")).ljust(width) for header, width in zip(headers, widths)) + " |")
     print(separator)
+
+
+def _normalize_hash_algorithm(algorithm: str) -> str:
+    normalized = algorithm.lower()
+    if normalized not in ("md5", "sha1", "sha256"):
+        raise ValueError(f"Unsupported hash algorithm: {algorithm}")
+    return normalized
+
+
+def _hash_file(path: Path, algorithm: str) -> str:
+    normalized = _normalize_hash_algorithm(algorithm)
+    digest = hashlib.new(normalized)
+    with path.open("rb") as file_obj:
+        for chunk in iter(lambda: file_obj.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _safe_filename(name: str) -> str:
+    return "".join(ch if ch.isalnum() or ch in ("-", "_", ".") else "_" for ch in name)[:128]
+
+
+def _parse_eprocess_fields(
+    context: MemoryContext,
+    eprocess_address: int,
+    layout: StructureLayout,
+) -> Dict[str, Any]:
+    parser = StructureParser(context, layout)
+    try:
+        return parser.parse(eprocess_address)
+    except Exception:
+        return parser.parse_physical(eprocess_address)
+
+
+def _find_process_entry(
+    context: MemoryContext,
+    start_eprocess: int,
+    target_pid: int,
+    eprocess_layout: Optional[StructureLayout],
+) -> Tuple[ProcessEntry, List[ProcessEntry]]:
+    process_entries = PsList(start_eprocess=start_eprocess, layout=eprocess_layout).run(context)
+    process_entry = next((entry for entry in process_entries if entry.pid == target_pid), None)
+    if process_entry is None:
+        raise ValueError(f"Process PID={target_pid} was not found")
+    return process_entry, process_entries
+
+
+def _process_dtb(
+    context: MemoryContext,
+    process_entry: ProcessEntry,
+    eprocess_layout: Optional[StructureLayout],
+) -> int:
+    if eprocess_layout is None:
+        raise ValueError("A real EPROCESS layout is required to extract the process CR3/DTB")
+    fields = _parse_eprocess_fields(context, process_entry.eprocess, eprocess_layout)
+    dtb = fields.get("DirectoryTableBase")
+    if dtb is None:
+        raise ValueError(f"Process PID={process_entry.pid} does not expose DirectoryTableBase in EPROCESS")
+    dtb = int(dtb)
+    if dtb == 0:
+        raise ValueError(f"Process PID={process_entry.pid} has an invalid DirectoryTableBase")
+    return dtb
+
+
+def _build_process_context(context: MemoryContext, dtb: int) -> MemoryContext:
+    return MemoryContext(
+        physical_layer=context.physical_layer,
+        translation_layer=Windowsx64TranslationLayer(physical_layer=context.physical_layer, cr3=dtb),
+    )
+
+
+def hash_process_by_pid(
+    context: MemoryContext,
+    target_pid: int,
+    start_eprocess: int,
+    eprocess_layout: Optional[StructureLayout],
+    hash_algorithm: str = "sha256",
+) -> Dict[str, Any]:
+    process_entry, process_entries = _find_process_entry(context, start_eprocess, target_pid, eprocess_layout)
+    dtb = _process_dtb(context, process_entry, eprocess_layout)
+    process_context = _build_process_context(context, dtb)
+    modules = DllList(target_pid=target_pid, process_entries=process_entries, eprocess_layout=eprocess_layout).run(context)
+    hasher = hashlib.new(_normalize_hash_algorithm(hash_algorithm))
+    bytes_hashed = 0
+
+    if modules:
+        for module in modules:
+            base = int(module["DllBase"])
+            size = int(module["SizeOfImage"])
+            if size <= 0:
+                continue
+            offset = 0
+            while offset < size:
+                chunk_size = min(0x1000, size - offset)
+                try:
+                    chunk = process_context.read_virtual(base + offset, chunk_size)
+                except Exception:
+                    offset += chunk_size
+                    continue
+                hasher.update(chunk)
+                bytes_hashed += len(chunk)
+                offset += len(chunk)
+    else:
+        fallback_data = process_context.read_virtual(process_entry.eprocess, 0x1000)
+        hasher.update(fallback_data)
+        bytes_hashed = len(fallback_data)
+
+    if bytes_hashed == 0:
+        raise ValueError(f"Unable to read memory for process PID={target_pid}")
+
+    return {
+        "PID": target_pid,
+        "Process": process_entry.name,
+        "Algorithm": hash_algorithm.upper(),
+        "Hash": hasher.hexdigest(),
+        "ModuleCount": len(modules),
+        "BytesHashed": bytes_hashed,
+    }
+
+
+def dump_process_memory_by_pid(
+    context: MemoryContext,
+    target_pid: int,
+    start_eprocess: int,
+    eprocess_layout: Optional[StructureLayout],
+    output_dir: Path,
+    hash_algorithm: str,
+    dump_size: int = 64 * 1024 * 1024,
+) -> Dict[str, Any]:
+    process_entry, process_entries = _find_process_entry(context, start_eprocess, target_pid, eprocess_layout)
+    dtb = _process_dtb(context, process_entry, eprocess_layout)
+    process_context = _build_process_context(context, dtb)
+    modules = DllList(target_pid=target_pid, process_entries=process_entries, eprocess_layout=eprocess_layout).run(context)
+
+    if modules:
+        primary = max(modules, key=lambda module: int(module["SizeOfImage"]))
+        safe_name = _safe_filename(process_entry.name or primary.get("BaseDllName", "process"))
+        dump_path = output_dir / f"pid_{target_pid}_{safe_name}_0x{int(primary['DllBase']):X}.dmp"
+        bytes_written = 0
+        with dump_path.open("wb") as dump_file:
+            size = int(primary["SizeOfImage"])
+            offset = 0
+            while offset < size and bytes_written < dump_size:
+                chunk_size = min(0x1000, size - offset, dump_size - bytes_written)
+                try:
+                    chunk = process_context.read_virtual(int(primary["DllBase"]) + offset, chunk_size)
+                except Exception:
+                    offset += chunk_size
+                    continue
+                dump_file.write(chunk)
+                bytes_written += len(chunk)
+                offset += len(chunk)
+    else:
+        safe_name = _safe_filename(process_entry.name)
+        dump_path = output_dir / f"pid_{target_pid}_{safe_name}_0x{int(process_entry.eprocess):X}.dmp"
+        data = process_context.read_virtual(process_entry.eprocess, min(dump_size, 0x1000))
+        dump_path.write_bytes(data)
+        bytes_written = len(data)
+
+    return {
+        "PID": target_pid,
+        "Process": process_entry.name,
+        "Dump File": str(dump_path),
+        "Bytes": bytes_written,
+        "Algorithm": hash_algorithm.upper(),
+        "Hash": _hash_file(dump_path, hash_algorithm),
+    }
 
 
 def physical_process_carver(physical_layer: PhysicalLayer) -> List[ProcessObject]:

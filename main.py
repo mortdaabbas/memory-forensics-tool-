@@ -12,6 +12,8 @@ from fmem.plugins import (
     PsList,
     PsScan,
     create_demo_memory_file,
+    hash_process_by_pid,
+    dump_process_memory_by_pid,
     physical_process_carver,
 )
 from fmem.structures import CR3Detector, REAL_EPROCESS_LAYOUT
@@ -43,7 +45,7 @@ def parse_cli_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--profile",
-        choices=["auto", "mock", "win10"],
+        choices=["auto", "win10"],
         default="auto",
         help="Structure profile to use for parsing memory objects.",
     )
@@ -63,7 +65,7 @@ def parse_cli_args() -> argparse.Namespace:
 
     subparsers.add_parser(
         "windows.psscan",
-        help="Carve process objects from physical memory using a mock EPROCESS signature.",
+        help="Carve process objects from physical memory by scanning for EPROCESS structures.",
     )
 
     dlllist_parser = subparsers.add_parser(
@@ -85,7 +87,41 @@ def parse_cli_args() -> argparse.Namespace:
 
     subparsers.add_parser(
         "windows.netscan",
-        help="Scan physical memory for mocked network endpoints and correlate with active PIDs.",
+        help="Scan physical memory for network endpoints and correlate with active PIDs.",
+    )
+
+    hash_parser = subparsers.add_parser(
+        "hash.process",
+        help="Hash process memory for a PID using process context.",
+    )
+    hash_parser.add_argument(
+        "--pid",
+        type=int,
+        required=True,
+        help="Target PID to hash.",
+    )
+    hash_parser.add_argument(
+        "--hash",
+        choices=["md5", "sha1", "sha256"],
+        default="sha256",
+        help="Hash algorithm to use.",
+    )
+
+    procdump_parser = subparsers.add_parser(
+        "windows.procdump",
+        help="Dump the process memory image for a given PID.",
+    )
+    procdump_parser.add_argument(
+        "--pid",
+        type=int,
+        required=True,
+        help="Target PID to dump.",
+    )
+    procdump_parser.add_argument(
+        "--hash",
+        choices=["md5", "sha1", "sha256"],
+        default="sha256",
+        help="Hash algorithm to use for the dumped file.",
     )
 
     return parser.parse_args()
@@ -147,17 +183,11 @@ def main() -> None:
             verification_virtual_addresses=[0x1000, 0xFFFFF80000000000],
         )
 
-        force_win_profile = image_path.name != "mock_memory.bin"
-        if force_win_profile:
-            profile = "win10"
-            logging.getLogger(__name__).debug(
-                "Non-mock image detected; forcing profile=win10",
-            )
+        if args.profile == "auto":
+            profile = detector.discover_profile()
+            logging.getLogger(__name__).debug("Auto-detected profile: %s", profile)
         else:
             profile = args.profile
-            if profile == "auto":
-                profile = detector.discover_profile()
-                logging.getLogger(__name__).debug("Auto-detected profile: %s", profile)
 
         start_eprocess_phys: Optional[int] = None
         start_eprocess = getattr(args, "start_eprocess", None)
@@ -255,6 +285,29 @@ def main() -> None:
             ]
             print("\nNetwork connections:")
             format_table(rows, ["Protocol", "Local", "Remote", "Status", "PID"])
+
+        elif args.plugin == "hash.process":
+            result = hash_process_by_pid(
+                context=context,
+                target_pid=args.pid,
+                start_eprocess=start_eprocess,
+                eprocess_layout=eprocess_layout,
+                hash_algorithm=args.hash,
+            )
+            print(f"\nProcess hash for PID {args.pid}:")
+            format_table([result], ["PID", "Process", "Algorithm", "Hash", "ModuleCount", "BytesHashed"])
+
+        elif args.plugin == "windows.procdump":
+            result = dump_process_memory_by_pid(
+                context=context,
+                target_pid=args.pid,
+                start_eprocess=start_eprocess,
+                eprocess_layout=eprocess_layout,
+                output_dir=image_path.parent,
+                hash_algorithm=args.hash,
+            )
+            print(f"\nProcess dump for PID {args.pid}:")
+            format_table([result], ["PID", "Process", "Dump File", "Bytes", "Algorithm", "Hash"])
 
 
 if __name__ == "__main__":
